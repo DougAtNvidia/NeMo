@@ -27,6 +27,8 @@ from nemo.utils import AppState, logging
 r"""
 Script to convert a legacy (non-mcore path) nemo checkpoint into mcore-path checkpoint for GPT models.
 
+Please use a container later than 23.10 or the current github main branch
+
 *Important* Before running this script, please first
 1) convert your legacy checkpoint to TP1 PP1 format:
     python examples/nlp/language_modeling/megatron_change_num_partitions.py \
@@ -35,18 +37,18 @@ Script to convert a legacy (non-mcore path) nemo checkpoint into mcore-path chec
     --target_pipeline_model_parallel_size=1
 2) extract your nemo file to a folder with
     tar -xvf filename.nemo
-        
+
 Then, run this conversion script:
 python convert_nemo_gpt_to_mcore.py \
- --in-file <path to extracted, TP1 PP1 legacy checkpoint folder> \
- --out-file <path to output nemo ile>
+ --in-folder <path to extracted, TP1 PP1 legacy checkpoint folder> \
+ --out-file <path to output nemo file>
 """
 
 
 def get_args():
     parser = ArgumentParser()
     parser.add_argument(
-        "--in-file", type=str, default=None, required=True, help="Path to extracted, TP1 PP1 NeMo GPT checkpoint.",
+        "--in-folder", type=str, default=None, required=True, help="Path to extracted, TP1 PP1 NeMo GPT checkpoint.",
     )
     parser.add_argument(
         "--out-file", type=str, default=None, required=True, help="Path to output mcore weights file (ends in .nemo)."
@@ -56,6 +58,16 @@ def get_args():
         action="store_true",
         help="Load model in cpu only. Useful if the model cannot fit in GPU memory, "
         "but this option makes the conversion script significantly slower.",
+    )
+    parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Run conversion again and overwrite output file when the output file already exists",
+    )
+    parser.add_argument(
+        "--ignore-if-missing",
+        default="rotary_pos_emb.inv_freq",
+        help="comma-separated list of state_dict keys that are known to be missing in mcore and can be safely ignored",
     )
     args = parser.parse_args()
     return args
@@ -77,7 +89,7 @@ def get_mcore_model_from_nemo_file(nemo_restore_from_path, cpu_only=False):
         app_state.nemo_file_folder = nemo_restore_from_path
     else:
         logging.warning(
-            "`nemo_file_folder` is NOT set because checkpoint is not pre-extracted. Subsequent operations may fail."
+            "⚠️ `nemo_file_folder` is NOT set because checkpoint is not pre-extracted. Subsequent operations may fail."
         )
     mcore_model = MegatronGPTModel(model_cfg, trainer=trainer)
     return mcore_model
@@ -143,7 +155,7 @@ def build_key_mapping(nemo_cfg):
     return mcore_to_nemo_mapping
 
 
-def load_model(model, state_dict):
+def load_model(model, state_dict, ignore_if_missing=tuple()):
     # try:
     for name, module in model.named_parameters():
         if name in state_dict:
@@ -155,7 +167,12 @@ def load_model(model, state_dict):
         if name in state_dict:
             buffer.data = state_dict.pop(name)
 
-    if len(state_dict.keys()) != 0:
+    # Some previous buffers are known to be removed in new mcore models => it is ok to ignore them.
+    for key in list(state_dict):
+        if any(key.endswith(suffix) for suffix in ignore_if_missing):
+            state_dict.pop(key)
+
+    if state_dict:
         raise RuntimeError(f"Additional keys: {state_dict.keys()} in state_dict but not in model.")
 
     return model
@@ -163,22 +180,39 @@ def load_model(model, state_dict):
 
 def restore_model(nemo_file, cpu_only=False):
     dummy_trainer = Trainer(devices=1, accelerator='cpu', strategy=NLPDDPStrategy())
-    if cpu_only:
-        map_location = torch.device('cpu')
-        model_config = MegatronGPTModel.restore_from(
-            nemo_file, trainer=dummy_trainer, return_config=True, map_location=map_location
+    map_location = torch.device('cpu') if cpu_only else None
+    model_config = MegatronGPTModel.restore_from(
+        nemo_file, trainer=dummy_trainer, return_config=True, map_location=map_location
+    )
+    model_config.use_cpu_initialization = cpu_only
+
+    if model_config.get('sequence_parallel', None):
+        model_config.sequence_parallel = False
+
+    # To copy weights in the original precision, we have to turn on O2.
+    orig_megatron_amp_O2_value = model_config.megatron_amp_O2
+    if "target" in model_config and model_config.target.endswith("MegatronGPTSFTModel"):
+        logging.warning(
+            "⚠️ Model target is `MegatronGPTSFTModel` which may not work with this conversion script. "
+            "This is a known issue. For now, please modify the config yaml file to use `MegatronGPTModel`."
         )
-        model_config.use_cpu_initialization = True
-    else:
-        model_config, map_location = None, None
-    return MegatronGPTModel.restore_from(
+
+    if model_config.precision in ['bf16', 'bf16-mixed']:
+        model_config.megatron_amp_O2 = True
+
+    model = MegatronGPTModel.restore_from(
         nemo_file, trainer=dummy_trainer, override_config_path=model_config, map_location=map_location
     )
 
+    # restore O2 to the original value so mcore model has the same config
+    model.cfg.megatron_amp_O2 = orig_megatron_amp_O2_value
+    return model
 
-def convert(input_nemo_file, output_nemo_file, skip_if_output_exists=True, cpu_only=False):
+
+def convert(input_nemo_file, output_nemo_file, skip_if_output_exists=True, cpu_only=False, ignore_if_missing=tuple()):
     if skip_if_output_exists and os.path.exists(output_nemo_file):
         logging.info(f"Output file already exists ({output_nemo_file}), skipping conversion...")
+        logging.info("If you want to overwrite the output file, please run with --overwrite flag")
         return
     nemo_model = restore_model(input_nemo_file, cpu_only=cpu_only)
 
@@ -193,11 +227,13 @@ def convert(input_nemo_file, output_nemo_file, skip_if_output_exists=True, cpu_o
                 mcore_state_dict[mcore_param] = torch.cat(
                     [nemo_state_dict[nemo_param], nemo_state_dict[second_param]], dim=0
                 )
+            else:
+                mcore_state_dict[mcore_param] = nemo_state_dict[nemo_param]
         else:
             mcore_state_dict[mcore_param] = nemo_state_dict[nemo_param]
 
     mcore_model = get_mcore_model_from_nemo_file(input_nemo_file, cpu_only=cpu_only)
-    mcore_model = load_model(mcore_model, mcore_state_dict)
+    mcore_model = load_model(mcore_model, mcore_state_dict, ignore_if_missing=ignore_if_missing)
 
     if nemo_model.cfg.tokenizer.model is not None:
         logging.info("registering artifact: tokenizer.model = " + nemo_tokenizer_model)
@@ -205,10 +241,12 @@ def convert(input_nemo_file, output_nemo_file, skip_if_output_exists=True, cpu_o
 
     mcore_model.cfg.use_cpu_initialization = False
     mcore_model.save_to(output_nemo_file)
-    logging.info(f"Done. Model saved to {output_nemo_file}")
+    logging.info(f"✅ Done. Model saved to {output_nemo_file}")
+    del mcore_model
+    del nemo_model
 
 
-def run_sanity_checks(nemo_file, mcore_file, cpu_only=False):
+def run_sanity_checks(nemo_file, mcore_file, cpu_only=False, ignore_if_missing=tuple()):
 
     nemo_model = restore_model(nemo_file, cpu_only=cpu_only).eval()
     mcore_model = restore_model(mcore_file, cpu_only=cpu_only).eval()
@@ -239,12 +277,15 @@ def run_sanity_checks(nemo_file, mcore_file, cpu_only=False):
                 # linear_fc1.weight should map to concat(dense_h_to_4h.weight, dense_h_to_4h_2.weight)
                 # but build_key_mapping only maps it to dense_h_to_4h.weight, so we handle the concat here.
                 second_param = nemo_param.replace("dense_h_to_4h.weight", "dense_h_to_4h_2.weight")
-                nemo_weight = torch.cat([nemo_weight, nemo_state_dict.pop(second_param)])
+                if second_param in nemo_state_dict:
+                    nemo_weight = torch.cat([nemo_weight, nemo_state_dict.pop(second_param)])
             assert torch.allclose(mcore_weight, nemo_weight), f"❌ parameter {mcore_param} does not match"
         except KeyError:
             buffers = [k for k, v in mcore_model.named_buffers()]
             assert (
-                mcore_param in buffers or mcore_param.replace('model.', 'model.module.', 1) in buffers
+                mcore_param in buffers
+                or mcore_param.replace('model.', 'model.module.', 1) in buffers
+                or any(mcore_param.endswith(suffix) for suffix in ignore_if_missing)
             ), f"❌ parameter {mcore_param} is not found in the state dict or named_buffers()"
             nemo_state_dict.pop(nemo_param)
 
@@ -261,11 +302,28 @@ def run_sanity_checks(nemo_file, mcore_file, cpu_only=False):
 if __name__ == '__main__':
     args = get_args()
 
-    input_nemo_file = args.in_file
+    input_nemo_file = args.in_folder
     output_nemo_file = args.out_file
     cpu_only = args.cpu_only
+    overwrite = args.overwrite
+    ignore_if_missing = {key.strip() for key in args.ignore_if_missing.split(",")}
 
     os.makedirs(os.path.dirname(output_nemo_file), exist_ok=True)
-    convert(input_nemo_file, output_nemo_file, skip_if_output_exists=True, cpu_only=cpu_only)
+    try:
+        convert(
+            input_nemo_file,
+            output_nemo_file,
+            skip_if_output_exists=not overwrite,
+            cpu_only=cpu_only,
+            ignore_if_missing=ignore_if_missing,
+        )
+    except torch.cuda.OutOfMemoryError:
+        logging.error("Could not convert due to torch.cuda.OutOfMemoryError.")
+        logging.error("Please run the script with --cpu-only flag")
+        exit(1)
     torch.cuda.empty_cache()
-    run_sanity_checks(input_nemo_file, output_nemo_file, cpu_only=cpu_only)
+    try:
+        run_sanity_checks(input_nemo_file, output_nemo_file, cpu_only=cpu_only, ignore_if_missing=ignore_if_missing)
+    except torch.cuda.OutOfMemoryError:
+        logging.info("✅ Conversion was successful, but could not run sanity check due to torch.cuda.OutOfMemoryError.")
+        logging.info("Please run the script with the same command again to run sanity check.")
